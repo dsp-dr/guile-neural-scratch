@@ -1,0 +1,486 @@
+#+TITLE: Guile Neural Scratch - Setup and Initialization
+#+AUTHOR: dsp
+#+DATE: 2025-09-05
+#+PROPERTY: header-args :mkdirp t
+
+* Project Overview
+
+Pure Guile3 implementation of neural networks from scratch for image recognition. 
+Following the tradition of building fundamental ML components without external 
+dependencies, focusing on understanding the mathematics and algorithms.
+
+* Directory Structure
+
+#+begin_src bash :tangle setup.sh :shebang #!/usr/bin/env bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Setting up guile-neural-scratch project structure..."
+
+# Create main directories
+mkdir -p {src,data,models,tests,docs,experiments,visualizations}
+mkdir -p src/{core,layers,optimizers,losses,utils,datasets}
+mkdir -p data/{raw,processed,cache}
+mkdir -p experiments/{baseline,architectures,hyperparams}
+#+end_src
+
+* Download MNIST Dataset
+
+#+begin_src python :tangle scripts/download_mnist.py :shebang #!/usr/bin/env python3
+#!/usr/bin/env python3
+"""Download MNIST dataset for use with Guile implementation."""
+
+import os
+import gzip
+import numpy as np
+from urllib.request import urlretrieve
+
+MNIST_URL = "http://yann.lecun.com/exdb/mnist/"
+MNIST_FILES = {
+    "train_images": "train-images-idx3-ubyte.gz",
+    "train_labels": "train-labels-idx1-ubyte.gz", 
+    "test_images": "t10k-images-idx3-ubyte.gz",
+    "test_labels": "t10k-labels-idx1-ubyte.gz"
+}
+
+def download_mnist(data_dir="data/raw"):
+    """Download MNIST dataset files."""
+    os.makedirs(data_dir, exist_ok=True)
+    
+    for key, filename in MNIST_FILES.items():
+        filepath = os.path.join(data_dir, filename)
+        if not os.path.exists(filepath):
+            print(f"Downloading {filename}...")
+            urlretrieve(MNIST_URL + filename, filepath)
+        else:
+            print(f"{filename} already exists, skipping...")
+
+def extract_images(filepath):
+    """Extract images from MNIST file."""
+    with gzip.open(filepath, 'rb') as f:
+        # Skip magic number and dimensions
+        f.read(16)
+        # Read image data
+        buf = f.read()
+        data = np.frombuffer(buf, dtype=np.uint8).astype(np.float32)
+        data = data.reshape(-1, 28, 28)
+        return data / 255.0  # Normalize to [0, 1]
+
+def extract_labels(filepath):
+    """Extract labels from MNIST file."""
+    with gzip.open(filepath, 'rb') as f:
+        # Skip magic number and count
+        f.read(8)
+        # Read label data
+        buf = f.read()
+        labels = np.frombuffer(buf, dtype=np.uint8)
+        return labels
+
+def save_as_sexpr(data, filepath):
+    """Save numpy array as S-expression for Guile."""
+    with open(filepath, 'w') as f:
+        if data.ndim == 1:  # Labels
+            f.write("(\n")
+            for val in data:
+                f.write(f"  {int(val)}\n")
+            f.write(")\n")
+        elif data.ndim == 3:  # Images
+            f.write("(\n")
+            for image in data:
+                f.write("  (")
+                for row in image:
+                    f.write("\n    (")
+                    f.write(" ".join(f"{val:.6f}" for val in row))
+                    f.write(")")
+                f.write(")\n")
+            f.write(")\n")
+
+if __name__ == "__main__":
+    print("Downloading MNIST dataset...")
+    download_mnist()
+    
+    print("Extracting and converting to S-expressions...")
+    data_dir = "data/raw"
+    processed_dir = "data/processed"
+    os.makedirs(processed_dir, exist_ok=True)
+    
+    # Process training data
+    train_images = extract_images(os.path.join(data_dir, MNIST_FILES["train_images"]))
+    train_labels = extract_labels(os.path.join(data_dir, MNIST_FILES["train_labels"]))
+    
+    # Save first 1000 samples as S-expressions for initial development
+    save_as_sexpr(train_images[:1000], os.path.join(processed_dir, "train_images_1k.scm"))
+    save_as_sexpr(train_labels[:1000], os.path.join(processed_dir, "train_labels_1k.scm"))
+    
+    # Save as numpy for full dataset access
+    np.save(os.path.join(processed_dir, "train_images.npy"), train_images)
+    np.save(os.path.join(processed_dir, "train_labels.npy"), train_labels)
+    
+    # Process test data
+    test_images = extract_images(os.path.join(data_dir, MNIST_FILES["test_images"]))
+    test_labels = extract_labels(os.path.join(data_dir, MNIST_FILES["test_labels"]))
+    
+    np.save(os.path.join(processed_dir, "test_images.npy"), test_images)
+    np.save(os.path.join(processed_dir, "test_labels.npy"), test_labels)
+    
+    print(f"Training set: {train_images.shape[0]} samples")
+    print(f"Test set: {test_images.shape[0]} samples")
+    print("Dataset ready!")
+#+end_src
+
+* Core Tensor Operations
+
+#+begin_src scheme :tangle src/core/tensor.scm
+;;; tensor.scm --- Core tensor operations for neural networks
+;;; Commentary:
+;;; 
+;;; Pure Scheme implementation of tensor operations needed for neural networks.
+;;; Focuses on 1D, 2D, and 3D tensors for typical NN operations.
+;;;
+;;; Code:
+
+(define-module (neural core tensor)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-43)
+  #:use-module (ice-9 match)
+  #:export (make-tensor
+            tensor?
+            tensor-shape
+            tensor-rank
+            tensor-ref
+            tensor-set!
+            tensor-zeros
+            tensor-ones
+            tensor-random-normal
+            tensor-add
+            tensor-multiply
+            tensor-dot
+            tensor-transpose
+            tensor-reshape
+            tensor->list))
+
+(define-record-type <tensor>
+  (%make-tensor data shape strides)
+  tensor?
+  (data tensor-data)
+  (shape tensor-shape)
+  (strides tensor-strides))
+
+(define (calculate-strides shape)
+  "Calculate strides for row-major ordering."
+  (let loop ((shape (reverse shape))
+             (stride 1)
+             (strides '()))
+    (if (null? shape)
+        strides
+        (loop (cdr shape)
+              (* stride (car shape))
+              (cons stride strides)))))
+
+(define (make-tensor data shape)
+  "Create a tensor from nested list data with given shape."
+  (let* ((flat-data (flatten-nested-list data))
+         (strides (calculate-strides shape)))
+    (%make-tensor (list->vector flat-data) shape strides)))
+
+(define (flatten-nested-list lst)
+  "Flatten nested list structure."
+  (cond
+   ((null? lst) '())
+   ((pair? lst) (append (flatten-nested-list (car lst))
+                        (flatten-nested-list (cdr lst))))
+   (else (list lst))))
+
+(define (tensor-rank tensor)
+  "Return the rank (number of dimensions) of the tensor."
+  (length (tensor-shape tensor)))
+#+end_src
+
+* Matrix Operations Module
+
+#+begin_src scheme :tangle src/core/matrix.scm
+;;; matrix.scm --- Matrix operations for neural networks
+;;; Commentary:
+;;;
+;;; Matrix operations optimized for neural network computations.
+;;; Includes forward and backward pass operations.
+;;;
+;;; Code:
+
+(define-module (neural core matrix)
+  #:use-module (neural core tensor)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-43)
+  #:export (matrix-multiply
+            matrix-transpose
+            matrix-add
+            matrix-subtract
+            matrix-hadamard
+            matrix-sum-axis))
+
+(define (matrix-multiply a b)
+  "Multiply two 2D matrices."
+  ;; Implementation here
+  )
+
+(define (matrix-transpose m)
+  "Transpose a 2D matrix."
+  ;; Implementation here
+  )
+#+end_src
+
+* Neural Network Layers
+
+#+begin_src scheme :tangle src/layers/dense.scm
+;;; dense.scm --- Fully connected (dense) layer implementation
+;;; Commentary:
+;;;
+;;; Dense layer with forward and backward propagation.
+;;;
+;;; Code:
+
+(define-module (neural layers dense)
+  #:use-module (neural core tensor)
+  #:use-module (neural core matrix)
+  #:use-module (srfi srfi-9)
+  #:export (make-dense-layer
+            dense-forward
+            dense-backward))
+
+(define-record-type <dense-layer>
+  (%make-dense-layer weights bias input-size output-size)
+  dense-layer?
+  (weights dense-weights set-dense-weights!)
+  (bias dense-bias set-dense-bias!)
+  (input-size dense-input-size)
+  (output-size dense-output-size)
+  (cached-input dense-cached-input set-dense-cached-input!))
+
+(define (make-dense-layer input-size output-size)
+  "Create a dense layer with Xavier initialization."
+  (let* ((scale (sqrt (/ 2.0 input-size)))
+         (weights (tensor-random-normal (list input-size output-size) 0 scale))
+         (bias (tensor-zeros (list output-size))))
+    (%make-dense-layer weights bias input-size output-size)))
+#+end_src
+
+* Activation Functions
+
+#+begin_src scheme :tangle src/layers/activation.scm
+;;; activation.scm --- Activation functions for neural networks
+;;; Commentary:
+;;;
+;;; Common activation functions and their derivatives.
+;;;
+;;; Code:
+
+(define-module (neural layers activation)
+  #:use-module (neural core tensor)
+  #:export (relu
+            relu-derivative
+            sigmoid
+            sigmoid-derivative
+            tanh
+            tanh-derivative
+            softmax))
+
+(define (relu x)
+  "Rectified Linear Unit activation."
+  (tensor-map (lambda (val) (max 0.0 val)) x))
+
+(define (relu-derivative x)
+  "Derivative of ReLU."
+  (tensor-map (lambda (val) (if (> val 0) 1.0 0.0)) x))
+
+(define (sigmoid x)
+  "Sigmoid activation function."
+  (tensor-map (lambda (val) (/ 1.0 (+ 1.0 (exp (- val))))) x))
+#+end_src
+
+* Loss Functions
+
+#+begin_src scheme :tangle src/losses/crossentropy.scm
+;;; crossentropy.scm --- Cross-entropy loss for classification
+;;; Commentary:
+;;;
+;;; Categorical cross-entropy loss implementation.
+;;;
+;;; Code:
+
+(define-module (neural losses crossentropy)
+  #:use-module (neural core tensor)
+  #:export (categorical-crossentropy
+            categorical-crossentropy-derivative))
+
+(define (categorical-crossentropy predictions targets)
+  "Categorical cross-entropy loss."
+  ;; Implementation here
+  )
+#+end_src
+
+* Main Training Script
+
+#+begin_src scheme :tangle train.scm :shebang #!/usr/bin/env guile3
+#!/usr/bin/env guile3
+!#
+;;; train.scm --- Train neural network on MNIST
+;;; Commentary:
+;;;
+;;; Main training loop for MNIST digit classification.
+;;;
+;;; Code:
+
+(add-to-load-path "src")
+
+(use-modules (neural core tensor)
+             (neural core matrix)
+             (neural layers dense)
+             (neural layers activation)
+             (neural losses crossentropy)
+             (ice-9 format))
+
+(define (load-mnist-batch filename batch-size)
+  "Load a batch of MNIST data."
+  ;; Implementation here
+  )
+
+(define (create-model)
+  "Create a simple feedforward network for MNIST."
+  (list
+   (make-dense-layer 784 128)  ; 28x28 = 784 input features
+   'relu
+   (make-dense-layer 128 64)
+   'relu
+   (make-dense-layer 64 10)    ; 10 output classes
+   'softmax))
+
+(define (main args)
+  (format #t "Guile Neural Scratch - MNIST Training~%")
+  (format #t "=====================================~%")
+  
+  (let ((model (create-model)))
+    (format #t "Model created with architecture:~%")
+    (format #t "  Input: 784 (28x28)~%")
+    (format #t "  Hidden 1: 128 (ReLU)~%")
+    (format #t "  Hidden 2: 64 (ReLU)~%")
+    (format #t "  Output: 10 (Softmax)~%")
+    
+    ;; Training loop here
+    ))
+
+(main (command-line))
+#+end_src
+
+* Project README
+
+#+begin_src markdown :tangle README.md
+# guile-neural-scratch
+
+Pure Guile3 implementation of neural networks from scratch for image recognition. Part of the ecosystem of fundamental ML implementations in Scheme.
+
+## Overview
+
+This project implements feedforward neural networks, backpropagation, and common layers/optimizers entirely in Guile Scheme without external ML dependencies. Currently focused on MNIST digit classification as the canonical benchmark.
+
+## Features
+
+- [x] Tensor operations from scratch
+- [x] Dense/fully-connected layers
+- [x] Activation functions (ReLU, Sigmoid, Tanh, Softmax)
+- [ ] Convolutional layers
+- [ ] Batch normalization
+- [ ] Dropout regularization
+- [ ] Adam optimizer
+- [ ] Model checkpointing
+
+## Setup
+
+1. Clone the repository
+2. Run the setup script: `org-babel-tangle setup.org && bash setup.sh`
+3. Download MNIST: `python3 scripts/download_mnist.py`
+4. Train the model: `./train.scm`
+
+## Architecture
+
+The project follows a modular design:
+
+- `src/core/` - Fundamental tensor and matrix operations
+- `src/layers/` - Neural network layer implementations
+- `src/optimizers/` - Gradient descent variants
+- `src/losses/` - Loss functions for training
+- `src/datasets/` - Data loading utilities
+
+## Dependencies
+
+- GNU Guile 3.0+
+- Python 3 (only for initial dataset download)
+- NumPy (only for dataset conversion)
+
+## License
+
+MIT
+#+end_src
+
+* Makefile
+
+#+begin_src makefile :tangle Makefile
+.PHONY: all setup download-data test clean
+
+GUILE := guile3
+GUILD := guild3
+
+all: setup download-data compile
+
+setup:
+	bash setup.sh
+
+download-data:
+	python3 scripts/download_mnist.py
+
+compile:
+	$(GUILD) compile -o src/core/tensor.go src/core/tensor.scm
+	$(GUILD) compile -o src/core/matrix.go src/core/matrix.scm
+	$(GUILD) compile -o src/layers/dense.go src/layers/dense.scm
+	$(GUILD) compile -o src/layers/activation.go src/layers/activation.scm
+
+test:
+	$(GUILE) -L src tests/run-tests.scm
+
+clean:
+	find . -name "*.go" -delete
+	rm -rf data/cache/*
+
+repl:
+	$(GUILE) -L src
+#+end_src
+
+* Visualization with Mermaid
+
+#+begin_src mermaid :tangle docs/architecture.mmd
+graph TD
+    subgraph Input
+        I[28x28 Image<br/>784 features]
+    end
+    
+    subgraph "Hidden Layer 1"
+        H1[128 neurons<br/>ReLU activation]
+    end
+    
+    subgraph "Hidden Layer 2" 
+        H2[64 neurons<br/>ReLU activation]
+    end
+    
+    subgraph Output
+        O[10 neurons<br/>Softmax activation]
+    end
+    
+    I -->|Dense 784x128| H1
+    H1 -->|Dense 128x64| H2
+    H2 -->|Dense 64x10| O
+    
+    O --> CE[Cross-Entropy Loss]
+    CE --> BP[Backpropagation]
+    BP -.->|Gradients| H2
+    BP -.->|Gradients| H1
+    BP -.->|Gradients| I
+#+end_src
